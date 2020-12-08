@@ -1,0 +1,237 @@
+import numpy as np
+from shapreg import utils, games, stochastic_games
+from tqdm.auto import tqdm
+
+
+def default_batch_size(game):
+    '''Determine batch size.'''
+    if isinstance(game, (games.DatasetLossGame, games.DatasetOutputGame)):
+        return 32
+    else:
+        return 512
+
+
+def calculate_A(num_players):
+    '''Calculate A parameter's exact form.'''
+    p_coaccur = (
+        (np.sum((np.arange(2, num_players) - 1)
+                / (num_players - np.arange(2, num_players)))) /
+        (num_players * (num_players - 1) *
+         np.sum(1 / (np.arange(1, num_players)
+                * (num_players - np.arange(1, num_players))))))
+    A = np.eye(num_players) * 0.5 + (1 - np.eye(num_players)) * p_coaccur
+    return A
+
+
+def calculate_exact_result(A, b, v0, v1, b_sum_squares, n):
+    '''Calculate the regression coefficients and uncertainty estimates.'''
+    num_players = A.shape[1]
+    A_inv_one = np.linalg.solve(A, np.ones(num_players))
+    A_inv_vec = np.linalg.solve(A, b)
+    values = (
+        A_inv_vec.T -
+        A_inv_one * (np.sum(A_inv_vec, axis=0, keepdims=True) - v1 + v0).T
+        / np.sum(A_inv_one))
+
+    # Calculate variance.
+    try:
+        b_sum_squares = 0.5 * (b_sum_squares
+                               + np.moveaxis(b_sum_squares, -2, -1))
+        b_cov = b_sum_squares / (n ** 2)
+        cholesky = np.linalg.cholesky(b_cov)
+        L = (
+            np.linalg.solve(A, cholesky) +
+            np.matmul(np.outer(A_inv_one, A_inv_one), cholesky)
+            / np.sum(A_inv_one))
+        beta_cov = np.matmul(L, np.moveaxis(L, -2, -1))
+        var = np.diagonal(beta_cov, offset=0, axis1=-2, axis2=-1)
+        std = var ** 0.5
+    except np.linalg.LinAlgError:
+        # b_cov likely is not PSD due to insufficient samples.
+        std = np.ones(num_players) * np.nan
+
+    return values, std
+
+
+def ShapleyRegression(game,
+                      batch_size=None,
+                      detect_convergence=True,
+                      thresh=0.01,
+                      n_samples=None,
+                      variance_reduction=True,
+                      return_all=False,
+                      bar=True,
+                      verbose=False):
+    # Verify arguments.
+    if isinstance(game, games.CooperativeGame):
+        stochastic = False
+    elif isinstance(game, stochastic_games.StochasticCooperativeGame):
+        stochastic = True
+    else:
+        raise ValueError('game must be CooperativeGame or '
+                         'StochasticCooperativeGame')
+
+    if batch_size is None:
+        batch_size = default_batch_size(game)
+    else:
+        assert isinstance(batch_size, int)
+        assert batch_size >= 1
+
+    # Possibly force convergence detection.
+    if n_samples is None:
+        n_samples = 1e20
+        if not detect_convergence:
+            detect_convergence = True
+            if verbose:
+                print('Turning convergence detection on')
+
+    if detect_convergence:
+        assert 0 < thresh < 1
+
+    # Weighting kernel (probability of each subset size).
+    num_players = game.players
+    weights = np.arange(1, num_players)
+    weights = 1 / (weights * (num_players - weights))
+    weights = weights / np.sum(weights)
+
+    # Calculate v(0) and v(1) for constraints.
+    if stochastic:
+        n = 0
+        v0 = 0
+        v1 = 0
+        for U in game.iterate(batch_size):
+            mbsize = len(U[0])
+            n += mbsize
+
+            # Update v0.
+            v0_temp = game(np.zeros((mbsize, num_players), dtype=bool), U)
+            v0 += np.sum(v0_temp - v0, axis=0) / n
+
+            # Update v1.
+            v1_temp = game(np.ones((mbsize, num_players), dtype=bool), U)
+            v1 += np.sum(v1_temp - v1, axis=0) / n
+    else:
+        v0 = game(np.zeros(num_players, dtype=bool))
+        v1 = game(np.ones(num_players, dtype=bool))
+
+    # Set up bar.
+    n_loops = int(n_samples / batch_size)
+    if bar:
+        if detect_convergence:
+            bar = tqdm(total=1)
+        else:
+            bar = tqdm(total=n_loops * batch_size)
+
+    # Setup.
+    A = calculate_A(num_players)
+    n = 0
+    b = 0
+    b_sum_squares = 0
+
+    # For tracking progress.
+    if return_all:
+        N_list = []
+        std_list = []
+        val_list = []
+
+    # Begin sampling.
+    for it in range(n_loops):
+        # Sample subsets.
+        S = np.zeros((batch_size, num_players), dtype=bool)
+        num_included = np.random.choice(num_players - 1, size=batch_size,
+                                        p=weights) + 1
+        for row, num in zip(S, num_included):
+            inds = np.random.choice(num_players, size=num, replace=False)
+            row[inds] = 1
+
+        # Sample exogenous (if applicable).
+        if stochastic:
+            U = game.sample(batch_size)
+
+        # Update estimators.
+        if variance_reduction:
+            # Paired samples.
+            if stochastic:
+                b_sample = 0.5 * (
+                    S.astype(float).T * game(S, U)[:, np.newaxis].T
+                    + np.logical_not(S).astype(float).T
+                    * game(np.logical_not(S), U)[:, np.newaxis].T).T - 0.5 * v0
+            else:
+                b_sample = 0.5 * (
+                    S.astype(float).T * game(S)[:, np.newaxis].T
+                    + np.logical_not(S).astype(float).T
+                    * game(np.logical_not(S))[:, np.newaxis].T).T - 0.5 * v0
+        else:
+            # Single sample.
+            if stochastic:
+                b_sample = (S.astype(float).T
+                            * game(S, U)[:, np.newaxis].T).T - 0.5 * v0
+            else:
+                b_sample = (S.astype(float).T
+                            * game(S)[:, np.newaxis].T).T - 0.5 * v0
+
+        # Welford's algorithm.
+        n += batch_size
+        b_diff = b_sample - b
+        b += np.sum(b_diff, axis=0) / n
+        b_diff2 = b_sample - b
+        b_sum_squares += np.sum(
+            np.expand_dims(b_diff, 2) * np.expand_dims(b_diff2, 1),
+            axis=0).T
+
+        # Calculate progress.
+        values, std = calculate_exact_result(
+            A, b, v0, v1, b_sum_squares, n)
+        ratio = np.max(
+            np.max(std, axis=-1) / (values.max(axis=-1) - values.min(axis=-1)))
+
+        # Print progress message.
+        if verbose:
+            if detect_convergence:
+                print('StdDev Ratio = {:.4f} (Converge at {:.4f})'.format(
+                    ratio, thresh))
+            else:
+                print('StdDev Ratio = {:.4f}'.format(ratio))
+
+        # Check for convergence.
+        if detect_convergence:
+            if ratio < thresh:
+                if verbose:
+                    print('Detected convergence')
+
+                # Skip bar ahead.
+                if bar:
+                    bar.n = bar.total
+                    bar.refresh()
+                break
+
+        # Forecast number of iterations required.
+        if detect_convergence:
+            N_est = (it + 1) * (ratio / thresh) ** 2
+            if bar and not np.isnan(N_est):
+                bar.n = np.around((it + 1) / N_est, 4)
+                bar.refresh()
+        elif bar:
+            bar.update(batch_size)
+
+        # Save intermediate quantities.
+        if return_all:
+            val_list.append(values)
+            std_list.append(std)
+            if detect_convergence:
+                N_list.append(N_est)
+
+    # Return results.
+    if return_all:
+        # Dictionary for progress tracking.
+        iters = (np.arange(it) + 1) * batch_size * (1 + int(variance_reduction))
+        tracking_dict = {
+            'values': val_list,
+            'std': std_list,
+            'iters': iters}
+        if detect_convergence:
+            tracking_dict['N_est'] = N_list
+
+        return utils.ShapleyValues(values, std), tracking_dict
+    else:
+        return utils.ShapleyValues(values, std)
