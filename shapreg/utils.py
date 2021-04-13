@@ -20,6 +20,10 @@ def crossentropyloss(pred, target):
 
 def mseloss(pred, target):
     '''MSE loss that does not average across samples.'''
+    if len(pred.shape) == 1:
+        pred = pred[:, np.newaxis]
+    if len(target.shape) == 1:
+        target = target[:, np.newaxis]
     return np.sum((pred - target) ** 2, axis=1)
 
 
