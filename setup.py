@@ -7,9 +7,9 @@ setuptools.setup(
     author_email="icovert@cs.washington.edu",
     description="For estimating Shapley values via linear regression.",
     long_description="""
-        For calculating the Shapley values of arbitrary cooperative games via 
-        linear regression. We use a nearly unbiased estimator with variance 
-        reduction tricks to accelerate convergence.
+        For calculating the Shapley values of any cooperative game via 
+        linear regression. We use an empirically unbiased estimator with
+        variance reduction tricks to accelerate convergence.
     """,
     long_description_content_type="text/markdown",
     url="https://github.com/iancovert/shapley-regression",
